@@ -1,0 +1,12 @@
+@Unreal_PI_HostAddress = http://localhost:5070
+
+POST {{Unreal_PI_HostAddress}}/api/progresso/coletar
+Content-Type: application/json
+
+{
+  "fase": "TesteAPI",
+  "idItem": "Teste_01",
+  "itemA": 1,
+  "itemB": 0,
+  "bugigangas": 0
+}

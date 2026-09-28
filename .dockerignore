@@ -1,0 +1,14 @@
+**/bin
+**/obj
+**/.vs
+**/.git
+**/appsettings.json
+**/appsettings.Development.json
+**/appsettings.*.local.json
+**/.env
+**/.env.*
+**/*.sql
+**/*.user
+**/*.suo
+backups
+deploy
