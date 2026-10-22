@@ -12,6 +12,21 @@ if (conexao == null)
 
 var app = builder.Build();
 
+// Aplicacao idempotente antes de aceitar requisicoes. O SQL e incorporado ao
+// assembly para funcionar tambem na imagem Docker publicada pelo Railway.
+await using (var recurso = typeof(Progresso).Assembly.GetManifestResourceStream(
+    "Migrations.003-receitas-bugigangas.sql")
+    ?? throw new InvalidOperationException("Migration de receitas ausente no assembly."))
+using (var leitorSql = new StreamReader(recurso))
+await using (var bancoReceitas = new MySqlConnection(conexao))
+{
+    var sqlReceitas = await leitorSql.ReadToEndAsync();
+    await bancoReceitas.OpenAsync();
+    await using var comandoReceitas = new MySqlCommand(sqlReceitas, bancoReceitas);
+    await comandoReceitas.ExecuteNonQueryAsync();
+    app.Logger.LogInformation("Cadastro das receitas das quatro fases atualizado.");
+}
+
 // GET /api/progresso
 // Carrega fase, checkpoint, vida e itens do save principal.
 app.MapGet("/api/progresso", async () =>
@@ -85,6 +100,11 @@ app.MapPut("/api/progresso", async (Progresso dados) =>
 // Salva as quantidades de itens e marca um objeto do cenário como coletado.
 app.MapPost("/api/progresso/coletar", async (ColetaItem dados) =>
 {
+    if (string.IsNullOrWhiteSpace(dados.Fase) || dados.Fase.Length > 50
+        || string.IsNullOrWhiteSpace(dados.IdItem) || dados.IdItem.Length > 100
+        || dados.ItemA < 0 || dados.ItemB < 0 || dados.Bugigangas < 0)
+        return Results.BadRequest("Informe fase, ID do objeto e quantidades não negativas.");
+
     await using var banco = new MySqlConnection(conexao);
     await banco.OpenAsync();
 
@@ -245,7 +265,53 @@ app.MapPost("/api/progresso/novo-jogo", async (NovoJogo dados) =>
     });
 });
 
+// O catalogo nao guarda progresso: Novo Jogo preserva estas receitas.
+app.MapGet("/api/progresso/{fase}/receita", async (string fase) =>
+{
+    await using var banco = new MySqlConnection(conexao);
+    await banco.OpenAsync();
+    await using var comando = new MySqlCommand("""
+        SELECT item_a_nome, item_b_nome, bugiganga_nome, quantidade_a, quantidade_b
+        FROM receitas_bugigangas WHERE fase = @fase
+        """, banco);
+    comando.Parameters.AddWithValue("@fase", fase.Trim());
+    await using var leitor = await comando.ExecuteReaderAsync();
+    if (!await leitor.ReadAsync()) return Results.NotFound("Receita não cadastrada para esta fase.");
+    return Results.Ok(new {
+        fase = fase.Trim(),
+        itemANome = leitor.GetString("item_a_nome"),
+        itemBNome = leitor.GetString("item_b_nome"),
+        bugigangaNome = leitor.GetString("bugiganga_nome"),
+        quantidadeA = leitor.GetInt32("quantidade_a"),
+        quantidadeB = leitor.GetInt32("quantidade_b")
+    });
+});
+
+// Grava o resultado da fabricacao/uso feito em Blueprint sem inventar uma coleta.
+// Mantem o contrato itemA/itemB/bugigangas usado pela fase 1.
+app.MapPut("/api/progresso/{fase}/inventario", async (string fase, InventarioFase dados) =>
+{
+    if (string.IsNullOrWhiteSpace(fase) || fase.Length > 50
+        || dados.ItemA < 0 || dados.ItemB < 0 || dados.Bugigangas < 0)
+        return Results.BadRequest("Informe uma fase e quantidades não negativas.");
+    await using var banco = new MySqlConnection(conexao);
+    await banco.OpenAsync();
+    await using var comando = new MySqlCommand("""
+        INSERT INTO inventario_fase (fase, item_a, item_b, bugigangas)
+        VALUES (@fase, @a, @b, @qtd)
+        ON DUPLICATE KEY UPDATE item_a = @a, item_b = @b, bugigangas = @qtd
+        """, banco);
+    comando.Parameters.AddWithValue("@fase", fase.Trim());
+    comando.Parameters.AddWithValue("@a", dados.ItemA);
+    comando.Parameters.AddWithValue("@b", dados.ItemB);
+    comando.Parameters.AddWithValue("@qtd", dados.Bugigangas);
+    await comando.ExecuteNonQueryAsync();
+    return Results.Ok(new { fase = fase.Trim(), dados.ItemA, dados.ItemB, dados.Bugigangas });
+});
+
 app.Run();
+
+record InventarioFase(int ItemA, int ItemB, int Bugigangas);
 
 record Progresso(
     string Fase,

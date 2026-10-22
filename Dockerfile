@@ -1,6 +1,7 @@
 FROM mcr.microsoft.com/dotnet/sdk:10.0 AS build
 WORKDIR /src
 COPY Unreal_PI/Unreal_PI.csproj Unreal_PI/
+COPY deploy/003-receitas-bugigangas.sql deploy/
 RUN dotnet restore Unreal_PI/Unreal_PI.csproj
 COPY Unreal_PI/ Unreal_PI/
 RUN dotnet publish Unreal_PI/Unreal_PI.csproj -c Release -o /app/publish --no-restore /p:UseAppHost=false

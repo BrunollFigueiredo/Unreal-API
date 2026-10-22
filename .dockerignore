@@ -12,3 +12,6 @@
 **/*.suo
 backups
 deploy
+!deploy/
+deploy/*
+!deploy/003-receitas-bugigangas.sql
