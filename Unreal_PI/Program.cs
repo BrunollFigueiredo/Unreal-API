@@ -1,4 +1,5 @@
 using MySqlConnector;
+using System.Text.Json;
 
 var builder = WebApplication.CreateBuilder(args);
 
@@ -14,8 +15,10 @@ var app = builder.Build();
 
 // Aplicacao idempotente antes de aceitar requisicoes. O SQL e incorporado ao
 // assembly para funcionar tambem na imagem Docker publicada pelo Railway.
+foreach (var migration in new[] { "003-receitas-bugigangas.sql", "004-estado-combate.sql" })
+{
 await using (var recurso = typeof(Progresso).Assembly.GetManifestResourceStream(
-    "Migrations.003-receitas-bugigangas.sql")
+    "Migrations." + migration)
     ?? throw new InvalidOperationException("Migration de receitas ausente no assembly."))
 using (var leitorSql = new StreamReader(recurso))
 await using (var bancoReceitas = new MySqlConnection(conexao))
@@ -24,7 +27,8 @@ await using (var bancoReceitas = new MySqlConnection(conexao))
     await bancoReceitas.OpenAsync();
     await using var comandoReceitas = new MySqlCommand(sqlReceitas, bancoReceitas);
     await comandoReceitas.ExecuteNonQueryAsync();
-    app.Logger.LogInformation("Cadastro das receitas das quatro fases atualizado.");
+    app.Logger.LogInformation("Migration {Migration} aplicada.", migration);
+}
 }
 
 // GET /api/progresso
@@ -231,6 +235,15 @@ app.MapPost("/api/progresso/novo-jogo", async (NovoJogo dados) =>
     await banco.OpenAsync();
     await using var transacao = await banco.BeginTransactionAsync();
 
+    // Serializa o reset com os saves da luta; pedidos da partida anterior
+    // serao recusados mesmo se chegarem depois da confirmacao de Novo Jogo.
+    await using var novaSessao = new MySqlCommand(
+        "UPDATE sessao_save SET sessao = UUID() WHERE jogador_id = 1", banco, transacao);
+    await novaSessao.ExecuteNonQueryAsync();
+    await using var limparCombates = new MySqlCommand(
+        "DELETE FROM combate_fase WHERE jogador_id = 1", banco, transacao);
+    await limparCombates.ExecuteNonQueryAsync();
+
     await using var limparColetados = new MySqlCommand(
         "DELETE FROM itens_coletados", banco, transacao);
     await limparColetados.ExecuteNonQueryAsync();
@@ -309,7 +322,94 @@ app.MapPut("/api/progresso/{fase}/inventario", async (string fase, InventarioFas
     return Results.Ok(new { fase = fase.Trim(), dados.ItemA, dados.ItemB, dados.Bugigangas });
 });
 
+app.MapGet("/api/progresso/{fase}/combate", async (string fase) =>
+{
+    if (!EstadoCombate.FaseValida(fase)) return Results.BadRequest("Fase de combate invalida.");
+    await using var banco = new MySqlConnection(conexao);
+    await banco.OpenAsync();
+    await using var comando = new MySqlCommand("""
+        SELECT s.sessao, c.estado FROM sessao_save s
+        LEFT JOIN combate_fase c ON c.jogador_id = s.jogador_id
+            AND c.sessao = s.sessao AND c.fase = @fase
+        WHERE s.jogador_id = 1
+        """, banco);
+    comando.Parameters.AddWithValue("@fase", fase);
+    await using var leitor = await comando.ExecuteReaderAsync();
+    if (!await leitor.ReadAsync()) return Results.Problem("Sessao do save ausente.");
+    JsonElement? estado = leitor.IsDBNull(1) ? null
+        : JsonSerializer.Deserialize<JsonElement>(leitor.GetString(1));
+    return Results.Ok(new { sessao = leitor.GetString(0), estado });
+});
+
+app.MapGet("/api/progresso/continuar-combate", async () =>
+{
+    await using var banco = new MySqlConnection(conexao);
+    await banco.OpenAsync();
+    await using var comando = new MySqlCommand("""
+        SELECT s.sessao, c.fase, c.revisao FROM sessao_save s
+        LEFT JOIN combate_fase c ON c.jogador_id = s.jogador_id AND c.sessao = s.sessao
+        WHERE s.jogador_id = 1 ORDER BY c.revisao DESC LIMIT 1
+        """, banco);
+    await using var leitor = await comando.ExecuteReaderAsync();
+    if (!await leitor.ReadAsync()) return Results.Problem("Sessao ausente.");
+    return Results.Ok(new { sessao = leitor.GetString(0),
+        fase = leitor.IsDBNull(1) ? "" : leitor.GetString(1),
+        revisao = leitor.IsDBNull(2) ? 0 : leitor.GetInt64(2) });
+});
+
+app.MapPut("/api/progresso/{fase}/combate", async (string fase, EstadoCombate dados) =>
+{
+    if (!EstadoCombate.FaseValida(fase) || !dados.Valido())
+        return Results.BadRequest("Estado da luta invalido.");
+    await using var banco = new MySqlConnection(conexao);
+    await banco.OpenAsync();
+    await using var transacao = await banco.BeginTransactionAsync();
+    await using var lerSessao = new MySqlCommand(
+        "SELECT sessao FROM sessao_save WHERE jogador_id = 1 FOR UPDATE", banco, transacao);
+    var sessao = (string?)await lerSessao.ExecuteScalarAsync();
+    if (sessao != dados.Sessao) return Results.Conflict("A partida foi reiniciada. Recarregue a fase.");
+    var json = JsonSerializer.Serialize(dados, new JsonSerializerOptions(JsonSerializerDefaults.Web));
+    await using var gravar = new MySqlCommand("""
+        INSERT INTO combate_fase (jogador_id, fase, sessao, revisao, estado)
+        VALUES (1, @fase, @sessao, @revisao, @estado)
+        ON DUPLICATE KEY UPDATE
+            estado = IF(@revisao >= revisao, @estado, estado),
+            sessao = IF(@revisao >= revisao, @sessao, sessao),
+            revisao = GREATEST(revisao, @revisao)
+        """, banco, transacao);
+    gravar.Parameters.AddWithValue("@fase", fase);
+    gravar.Parameters.AddWithValue("@sessao", dados.Sessao);
+    gravar.Parameters.AddWithValue("@revisao", dados.Revisao);
+    gravar.Parameters.AddWithValue("@estado", json);
+    await gravar.ExecuteNonQueryAsync();
+    await transacao.CommitAsync();
+    return Results.Ok(new { revisao = dados.Revisao });
+});
+
 app.Run();
+
+record PosicaoCombate(double X, double Y, double Z)
+{
+    public bool Valida() => double.IsFinite(X) && double.IsFinite(Y) && double.IsFinite(Z)
+        && Math.Abs(X) <= 1e8 && Math.Abs(Y) <= 1e8 && Math.Abs(Z) <= 1e8;
+}
+record EstadoCombate(string Sessao, long Revisao,
+    double VidaJogador, double VidaMaximaJogador, PosicaoCombate PosicaoJogador, double RotacaoJogador,
+    string BossId, double VidaBoss, double VidaMaximaBoss, PosicaoCombate PosicaoBoss, double RotacaoBoss,
+    bool EmCombate, bool BossFuria)
+{
+    public static bool FaseValida(string fase) => fase is "Cena_Fase1" or "Cena_Fase2"
+        or "Cena_Fase3_Nova" or "Cena_Fase4_Nova";
+    public bool Valido() => Guid.TryParse(Sessao, out _) && Revisao > 0
+        && Revisao <= DateTimeOffset.UtcNow.AddDays(1).ToUnixTimeMilliseconds()
+        && VidaValida(VidaJogador, VidaMaximaJogador) && VidaValida(VidaBoss, VidaMaximaBoss)
+        && PosicaoJogador is not null && PosicaoJogador.Valida()
+        && PosicaoBoss is not null && PosicaoBoss.Valida()
+        && double.IsFinite(RotacaoJogador) && double.IsFinite(RotacaoBoss)
+        && !string.IsNullOrWhiteSpace(BossId) && BossId.Length <= 200;
+    static bool VidaValida(double atual, double maxima) => double.IsFinite(atual)
+        && double.IsFinite(maxima) && maxima > 0 && maxima <= 1e9 && atual >= 0 && atual <= maxima;
+}
 
 record InventarioFase(int ItemA, int ItemB, int Bugigangas);
 
